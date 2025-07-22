@@ -1,0 +1,310 @@
+import os
+import openpyxl
+from telegram import Update, InputFile
+from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
+                          ConversationHandler, ContextTypes, filters)
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+EXCEL_FILE = "Таблица_Себестоимости_и_FoodCost_с_Прибылью.xlsx"
+ТТК_FILE = "ТТК.xlsx"
+INVENTORY_FILE = "inventory.xlsx"
+
+# Создание Excel, если его нет
+for file_name, headers in [(EXCEL_FILE, ["Ингредиент", "Цена за 1 кг"]),
+                           (ТТК_FILE, ["Блюдо", "Ингредиент", "Граммовка"]),
+                           (INVENTORY_FILE, ["Ингредиент", "Остаток (г)"])]:
+    if not os.path.exists(file_name):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(headers)
+        wb.save(file_name)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Используй команды: /ttk, /ttk_bulk, /zakup, /inventory, /delete, /table, /ttk_file и т.д."
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Действие отменено.")
+    return ConversationHandler.END
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    lines = text.split("\n")
+    wb = openpyxl.load_workbook(EXCEL_FILE)
+    ws = wb.active
+
+    for line in lines:
+        parts = line.replace("гр", "").split()
+        if len(parts) == 2:
+            ingredient = parts[0]
+            price_str = parts[1]
+        elif len(parts) >= 3:
+            ingredient = " ".join(parts[:-2])
+            try:
+                mass = float(parts[-2])
+                price = float(parts[-1])
+                price_per_kg = round((price / mass) * 1000, 2)
+                _update_or_add(ws, ingredient, price_per_kg)
+                continue
+            except:
+                continue
+        else:
+            continue
+
+        try:
+            price = float(price_str)
+            _update_or_add(ws, ingredient, price)
+        except:
+            continue
+
+    wb.save(EXCEL_FILE)
+    await update.message.reply_text("✅ Данные обновлены.")
+
+
+def _update_or_add(ws, ingredient, price):
+    found = False
+    for row in ws.iter_rows(min_row=2):
+        if row[0].value and row[0].value.lower() == ingredient.lower():
+            row[1].value = price
+            found = True
+            break
+    if not found:
+        ws.append([ingredient, price])
+
+
+async def delete_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = " ".join(context.args).strip().lower()
+    deleted = False
+
+    for file, col in [(EXCEL_FILE, 0), (ТТК_FILE, 0)]:
+        wb = openpyxl.load_workbook(file)
+        ws = wb.active
+        rows = list(ws.iter_rows(min_row=2))
+        for row in rows:
+            if row[col].value and row[col].value.strip().lower() == name:
+                ws.delete_rows(row[0].row)
+                deleted = True
+        wb.save(file)
+
+    if deleted:
+        await update.message.reply_text(f"🗑️ '{name}' удалён из таблиц.")
+    else:
+        await update.message.reply_text(f"❌ '{name}' не найден.")
+
+
+async def send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if os.path.exists(EXCEL_FILE):
+        with open(EXCEL_FILE, "rb") as file:
+            await update.message.reply_document(file, filename="Себестоимость.xlsx")
+
+
+async def send_ttk_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if os.path.exists(ТТК_FILE):
+        with open(ТТК_FILE, "rb") as file:
+            await update.message.reply_document(file, filename="ТТК.xlsx")
+
+
+INVENTORY_MODE = range(1)
+
+
+async def start_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введите остатки продуктов в формате:\nПродукт 1200\nПродукт 500")
+    return INVENTORY_MODE
+
+
+async def save_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = update.message.text.strip().split("\n")
+    wb_inv = openpyxl.load_workbook(INVENTORY_FILE)
+    ws_inv = wb_inv.active
+    ws_inv.delete_rows(2, ws_inv.max_row)
+
+    inventory = {}
+    for line in lines:
+        parts = line.replace("гр", "").split()
+        if len(parts) < 2:
+            continue
+        name = " ".join(parts[:-1])
+        try:
+            grams = float(parts[-1])
+            ws_inv.append([name, grams])
+            inventory[name.lower()] = grams
+        except ValueError:
+            continue
+    wb_inv.save(INVENTORY_FILE)
+
+    wb_price = openpyxl.load_workbook(EXCEL_FILE)
+    ws_price = wb_price.active
+    prices = {
+        row[0].value.lower(): row[1].value
+        for row in ws_price.iter_rows(min_row=2)
+        if row[0].value and row[1].value
+    }
+
+    total = 0
+    result_lines = []
+    for name, grams in inventory.items():
+        price_per_kg = prices.get(name)
+        if price_per_kg:
+            cost = grams / 1000 * price_per_kg
+            total += cost
+            result_lines.append(
+                f"{name.title()}: {int(grams)} гр × {price_per_kg}₽ = {round(cost, 2)}₽"
+            )
+        else:
+            result_lines.append(f"{name.title()}: нет цены в матрице")
+
+    result_lines.append(f"\n💰 Общая сумма остатков: {round(total, 2)}₽")
+    await update.message.reply_text("\n".join(result_lines))
+    return ConversationHandler.END
+
+
+ADD_TTK_NAME, ADD_TTK_ING = range(2)
+
+
+async def start_ttk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введите название блюда:")
+    return ADD_TTK_NAME
+
+
+async def get_ttk_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['ttk_name'] = update.message.text.strip()
+    await update.message.reply_text(
+        "Теперь перечисли ингредиенты с граммовкой (по одному на строке).")
+    return ADD_TTK_ING
+
+
+async def save_ttk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data['ttk_name']
+    lines = update.message.text.strip().split("\n")
+    wb = openpyxl.load_workbook(ТТК_FILE)
+    ws = wb.active
+
+    for line in lines:
+        clean = line.replace("гр", "").strip()
+        parts = clean.split()
+        if len(parts) < 2:
+            continue
+        ingredient = " ".join(parts[:-1])
+        try:
+            weight = float(parts[-1])
+            ws.append([name, ingredient, weight])
+        except ValueError:
+            continue
+
+    wb.save(ТТК_FILE)
+    await update.message.reply_text(f"✅ ТТК для «{name}» сохранён!")
+    return ConversationHandler.END
+
+
+async def calculate_zakup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = update.message.text.replace("/zakup", "").strip().split(",")
+    wb = openpyxl.load_workbook(ТТК_FILE)
+    ws = wb.active
+    summary = {}
+
+    for part in args:
+        tokens = part.strip().rsplit(" ", 1)
+        if len(tokens) != 2:
+            continue
+        dish, servings = tokens
+        try:
+            servings = int(servings)
+        except:
+            continue
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row[0].strip().lower() == dish.strip().lower():
+                name, grams = row[1], row[2]
+                summary[name] = summary.get(name, 0) + servings * grams
+
+    if not summary:
+        await update.message.reply_text("❌ Ничего не найдено")
+        return
+
+    result = ["🧾 Закуп:"]
+    for name, grams in summary.items():
+        if grams >= 1000:
+            result.append(f"{name}: {round(grams/1000, 2)} кг")
+        else:
+            result.append(f"{name}: {int(grams)} гр")
+    await update.message.reply_text("\n".join(result))
+
+
+BULK_MODE = range(1)
+
+
+async def start_ttk_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введи блоки ТТК с названиями:")
+    return BULK_MODE
+
+
+async def save_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = update.message.text.strip().split("\n")
+    wb = openpyxl.load_workbook(ТТК_FILE)
+    ws = wb.active
+
+    current_dish = None
+    for line in lines:
+        line = line.strip()
+        if line.lower().startswith("название:"):
+            current_dish = line.split(":", 1)[-1].strip()
+            continue
+        if not current_dish:
+            continue
+        clean = line.replace("гр", "").strip()
+        parts = clean.split()
+        if len(parts) < 2:
+            continue
+        ing = " ".join(parts[:-1])
+        try:
+            grams = float(parts[-1])
+            ws.append([current_dish, ing, grams])
+        except:
+            continue
+    wb.save(ТТК_FILE)
+    await update.message.reply_text("✅ ТТК загружены")
+    return ConversationHandler.END
+
+
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("table", send_excel))
+app.add_handler(CommandHandler("ttk_file", send_ttk_file))
+app.add_handler(CommandHandler("delete", delete_entry))
+app.add_handler(CommandHandler("zakup", calculate_zakup))
+
+app.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("inventory", start_inventory)],
+    states={INVENTORY_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_inventory)]},
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
+
+app.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("ttk", start_ttk)],
+    states={
+        ADD_TTK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_ttk_name)],
+        ADD_TTK_ING: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_ttk)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
+
+app.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("ttk_bulk", start_ttk_bulk)],
+    states={BULK_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_bulk)]},
+    fallbacks=[CommandHandler("cancel", cancel)],
+))
+
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+if __name__ == "__main__":
+    print("Бот запущен...")
+    app.run_polling()
